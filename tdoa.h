@@ -91,6 +91,8 @@ typedef struct {
 
     tdoa_config_t config;
 
+    double speed;  /**< Signal propagation speed (m/s), default: speed of light */
+
     /* Working buffers for algorithm */
     double *matrix_a;
     double *vector_b;
@@ -112,6 +114,13 @@ int tdoa_solver_init(tdoa_solver_t *solver);
  * @return 0 on success, -1 on error
  */
 int tdoa_solver_configure(tdoa_solver_t *solver, const tdoa_config_t *config);
+
+/**
+ * @brief Set signal propagation speed
+ * @param solver Pointer to solver context
+ * @param speed Propagation speed in m/s (e.g., SPEED_OF_LIGHT or SPEED_OF_SOUND)
+ */
+void tdoa_solver_set_speed(tdoa_solver_t *solver, double speed);
 
 /**
  * @brief Add a receiver to the solver

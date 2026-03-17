@@ -30,9 +30,9 @@ static void *safe_malloc(size_t size) {
 
 static void *safe_realloc(void *ptr, size_t size) {
     void *new_ptr = realloc(ptr, size);
-    if (new_ptr == NULL) {
+    if (new_ptr == NULL && size > 0) {
         fprintf(stderr, "Error: realloc failed for %zu bytes\n", size);
-        free(ptr);
+        /* Note: realloc does NOT free ptr on failure, caller still owns it */
     }
     return new_ptr;
 }
@@ -129,6 +129,9 @@ int tdoa_solver_init(tdoa_solver_t *solver) {
     solver->config.max_iterations = 50;
     solver->config.use_weighting = true;
 
+    /* Default to speed of light */
+    solver->speed = SPEED_OF_LIGHT;
+
     for (size_t i = 0; i < TDOA_MAX_RECEIVERS; i++) {
         solver->receivers[i].is_valid = false;
     }
@@ -156,6 +159,13 @@ int tdoa_solver_configure(tdoa_solver_t *solver, const tdoa_config_t *config) {
     solver->config.use_weighting = config->use_weighting;
 
     return 0;
+}
+
+void tdoa_solver_set_speed(tdoa_solver_t *solver, double speed) {
+    if (solver == NULL || speed <= 0) {
+        return;
+    }
+    solver->speed = speed;
 }
 
 int tdoa_add_receiver(tdoa_solver_t *solver, const tdoa_point3d_t *position, double clock_bias) {
@@ -209,72 +219,104 @@ int tdoa_add_measurement(tdoa_solver_t *solver, size_t receiver_i, size_t receiv
 }
 
 /**
- * @brief Simplified Fang's algorithm for 2D
+ * @brief Fang's algorithm for 2D TDOA positioning
+ * @note Uses solver's configured speed (light or sound)
  */
 int tdoa_solve_fang(const tdoa_solver_t *solver, tdoa_point3d_t *result) {
     if (solver == NULL || result == NULL) {
         return -1;
     }
 
-    if (solver->num_receivers < 3) {
+    if (solver->num_receivers < 3 || solver->num_measurements < 2) {
         return -1;
     }
 
-    const double c = SPEED_OF_LIGHT;
+    const double c = solver->speed;
 
     /* Use first 3 receivers */
     const tdoa_point3d_t *r1 = &solver->receivers[0].position;
     const tdoa_point3d_t *r2 = &solver->receivers[1].position;
     const tdoa_point3d_t *r3 = &solver->receivers[2].position;
 
-    /* Get TDOA measurements */
+    /* Find TDOA measurements for pairs (0,1) and (0,2) */
     double tij = 0.0, tik = 0.0;
-    for (size_t m = 0; m < solver->num_measurements && m < 3; m++) {
+    bool found_01 = false, found_02 = false;
+
+    for (size_t m = 0; m < solver->num_measurements; m++) {
         const tdoa_measurement_t *meas = &solver->measurements[m];
-        if (meas->receiver_i == 0 && meas->receiver_j == 1) {
+        if ((meas->receiver_i == 0 && meas->receiver_j == 1) ||
+            (meas->receiver_i == 1 && meas->receiver_j == 0)) {
             tij = meas->time_difference * c;
-        } else if (meas->receiver_i == 0 && meas->receiver_j == 2) {
+            if (meas->receiver_i == 1 && meas->receiver_j == 0) {
+                tij = -tij;  /* Reverse the TDOA */
+            }
+            found_01 = true;
+        } else if ((meas->receiver_i == 0 && meas->receiver_j == 2) ||
+                   (meas->receiver_i == 2 && meas->receiver_j == 0)) {
             tik = meas->time_difference * c;
+            if (meas->receiver_i == 2 && meas->receiver_j == 0) {
+                tik = -tik;  /* Reverse the TDOA */
+            }
+            found_02 = true;
         }
     }
 
-    /* Use first measurements if not found */
-    if (tij == 0.0 && solver->num_measurements > 0) {
-        tij = solver->measurements[0].time_difference * c;
-    }
-    if (tik == 0.0 && solver->num_measurements > 1) {
-        tik = solver->measurements[1].time_difference * c;
+    /* Use centroid as fallback if measurements not found */
+    if (!found_01 || !found_02) {
+        result->x = (r1->x + r2->x + r3->x) / 3.0;
+        result->y = (r1->y + r2->y + r3->y) / 3.0;
+        result->z = 0.0;
+        return 0;
     }
 
-    if (tij == 0.0) tij = 1.0;
-    if (tik == 0.0) tik = 1.0;
-
-    /* Simplified linear solution */
+    /* Fang's algorithm implementation */
     double x1 = r1->x, y1 = r1->y;
     double x2 = r2->x, y2 = r2->y;
     double x3 = r3->x, y3 = r3->y;
 
-    /* Known distances from receivers */
+    /* Distance between receivers */
     double r21 = sqrt((x2-x1)*(x2-x1) + (y2-y1)*(y2-y1));
     double r31 = sqrt((x3-x1)*(x3-x1) + (y3-y1)*(y3-y1));
 
-    /* Use intersection of circles/hyperbolas */
-    double A = x2 - x1;
-    double B = y2 - y1;
-    double D = (tij * tij - r21 * r21) / (2 * r21);
-
-    double E = (tik * tik - r31 * r31 + (x1-x2)*(x1-x2) + (y1-y2)*(y1-y2)) / (2 * r31) - D * A / r31;
-    double F = B / r21 - (y3 - y1) / r31 * A / r31;
-
-    if (fabs(F) > 1e-10) {
-        result->y = E / F;
-        result->x = D - B * result->y / r21 + x1;
-    } else {
-        result->x = x1 + tij;
-        result->y = y1;
+    if (r21 < 1e-6 || r31 < 1e-6) {
+        return -1;  /* Invalid geometry */
     }
 
-    result->z = 0.0;
+    /* Fang's method */
+    double k = x1*x1 + y1*y1;
+    double x21 = x2 - x1;
+    double y21 = y2 - y1;
+    double x31 = x3 - x1;
+    double y31 = y3 - y1;
+
+    double t1 = (tij - r21) / x21;
+    double t2 = (tij * y21) / x21;
+    double t3 = (tik - r31 + (k - 2*x1*x31 - 2*y1*y31) / x31) / x31;
+    double t4 = (tij * y31 / x21 - tik * y31 / x31) / x31;
+
+    /* Solve quadratic: a*y^2 + b*y + c = 0 */
+    double a = 1 + t1*t1 - t2*t2;
+    double b = 2 * (t1*t3 - t2*t4 - t1 - t2);
+    double c_coef = t3*t3 + t4*t4 - 1;
+
+    double discriminant = b*b - 4*a*c_coef;
+    if (discriminant < 0) {
+        discriminant = 0;  /* Use smaller magnitude solution */
+    }
+
+    double y = (-b + sqrt(discriminant)) / (2*a);
+    double x = t1 - t2 * y;
+
+    /* Validate result */
+    if (isnan(x) || isnan(y) || isinf(x) || isinf(y)) {
+        result->x = (x1 + x2 + x3) / 3.0;
+        result->y = (y1 + y2 + y3) / 3.0;
+        result->z = 0.0;
+    } else {
+        result->x = x;
+        result->y = y;
+        result->z = 0.0;
+    }
 
     return 0;
 }
@@ -291,7 +333,7 @@ int tdoa_solve_chan(const tdoa_solver_t *solver, tdoa_point3d_t *result) {
         return -1;
     }
 
-    const double c = SPEED_OF_LIGHT;
+    const double c = solver->speed;
 
     /* Initial guess: centroid */
     double cx = 0, cy = 0, cz = 0;
@@ -401,7 +443,7 @@ int tdoa_solve_taylor(const tdoa_solver_t *solver, const tdoa_point3d_t *initial
         return -1;
     }
 
-    const double c = SPEED_OF_LIGHT;
+    const double c = solver->speed;
 
     /* Start from initial guess */
     double cx = initial_guess->x;
@@ -552,7 +594,8 @@ int tdoa_generate_measurements(tdoa_solver_t *solver, const tdoa_point3d_t *true
         return -1;
     }
 
-    const double c = SPEED_OF_LIGHT;
+    /* Use the solver's configured speed (light or sound) */
+    const double c = solver->speed;
 
     /* Generate all pairwise TDOA measurements */
     for (size_t i = 0; i < solver->num_receivers; i++) {

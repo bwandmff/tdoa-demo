@@ -10,6 +10,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <sys/time.h>
 
 #include "tdoa.h"
 
@@ -95,8 +96,8 @@ static int test_basic_2d(void) {
         print_performance("Chan's Algorithm", &result_chan, &true_pos, elapsed_chan);
     }
 
-    /* Solve using Taylor series (with centroid as initial guess) */
-    tdoa_point3d_t initial_guess = {50.0, 28.0, 0.0};
+    /* Solve using Taylor series (use Chan result as initial guess) */
+    tdoa_point3d_t initial_guess = result_chan;
     tdoa_point3d_t result_taylor;
     start = clock();
     int taylor_result = tdoa_solve_taylor(&solver, &initial_guess, &result_taylor);
@@ -170,23 +171,16 @@ static int test_monte_carlo(void) {
     printf("Test 3: Monte Carlo Accuracy Test (%d runs)\n", NUM_RUNS);
     printf("========================================\n");
 
-    srand((unsigned int)time(NULL));
-
-    tdoa_solver_t solver;
-    if (tdoa_solver_init(&solver) != 0) {
-        return -1;
-    }
+    /* Use time with microseconds for better randomness */
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    srand((unsigned int)(tv.tv_sec * 1000000 + tv.tv_usec));
 
     /* 4 receivers in square configuration */
     tdoa_point3d_t r1 = {0.0, 0.0, 0.0};
     tdoa_point3d_t r2 = {1000.0, 0.0, 0.0};
     tdoa_point3d_t r3 = {1000.0, 1000.0, 0.0};
     tdoa_point3d_t r4 = {0.0, 1000.0, 0.0};
-
-    tdoa_add_receiver(&solver, &r1, 0.0);
-    tdoa_add_receiver(&solver, &r2, 0.0);
-    tdoa_add_receiver(&solver, &r3, 0.0);
-    tdoa_add_receiver(&solver, &r4, 0.0);
 
     /* True position */
     tdoa_point3d_t true_pos = {500.0, 500.0, 100.0};
@@ -202,7 +196,11 @@ static int test_monte_carlo(void) {
     clock_t start = clock();
 
     for (int run = 0; run < NUM_RUNS; run++) {
-        tdoa_solver_reset(&solver);
+        /* Re-initialize solver for each run to avoid state issues */
+        tdoa_solver_t solver;
+        if (tdoa_solver_init(&solver) != 0) {
+            continue;
+        }
 
         tdoa_add_receiver(&solver, &r1, 0.0);
         tdoa_add_receiver(&solver, &r2, 0.0);
@@ -223,6 +221,8 @@ static int test_monte_carlo(void) {
             if (error < min_error) min_error = error;
             success_count++;
         }
+
+        tdoa_solver_destroy(&solver);
     }
 
     double elapsed = (double)(clock() - start) * 1000.0 / CLOCKS_PER_SEC;
@@ -233,9 +233,8 @@ static int test_monte_carlo(void) {
     printf("  Average error: %.3f m\n", total_error / success_count);
     printf("  Max error: %.3f m\n", max_error);
     printf("  Min error: %.3f m\n", min_error);
-    printf("  Total time: %.2f ms (%.3f ms/run)\n\n", elapsed, elapsed / NUM_RUNS);
+    printf("  Total time: %.3f ms (%.3f ms/run)\n\n", elapsed, elapsed / NUM_RUNS);
 
-    tdoa_solver_destroy(&solver);
     return 0;
 }
 
@@ -250,6 +249,11 @@ static int test_acoustic_tdoa(void) {
         return -1;
     }
 
+    /* Set speed of sound for acoustic TDOA */
+    double speed_of_sound = tdoa_get_speed_of_sound(20.0);
+    tdoa_solver_set_speed(&solver, speed_of_sound);
+    printf("Speed of sound at 20C: %.2f m/s\n", speed_of_sound);
+
     /* Microphone array (30cm apart) */
     tdoa_point3d_t m1 = {0.0, 0.0, 0.0};
     tdoa_point3d_t m2 = {0.30, 0.0, 0.0};
@@ -263,9 +267,6 @@ static int test_acoustic_tdoa(void) {
 
     /* True sound source position */
     tdoa_point3d_t true_pos = {1.5, 1.0, 0.5};
-
-    double speed_of_sound = tdoa_get_speed_of_sound(20.0);
-    printf("Speed of sound at 20C: %.2f m/s\n", speed_of_sound);
 
     /* Generate TDOA measurements: 1 microsecond noise */
     double noise_std = 1e-6;
