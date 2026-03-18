@@ -88,12 +88,13 @@ typedef struct {
 
     tdoa_measurement_t *measurements;
     size_t num_measurements;
+    size_t max_measurements;  /**< Pre-allocated buffer size */
 
     tdoa_config_t config;
 
     double speed;  /**< Signal propagation speed (m/s), default: speed of light */
 
-    /* Working buffers for algorithm */
+    /* Pre-allocated working buffers */
     double *matrix_a;
     double *vector_b;
     double *result;
